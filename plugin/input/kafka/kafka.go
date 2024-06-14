@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"context"
+	"math"
 	"strings"
 	"time"
 
@@ -11,9 +12,8 @@ import (
 	"github.com/ozontech/file.d/metric"
 	"github.com/ozontech/file.d/pipeline"
 	"github.com/ozontech/file.d/pipeline/metadata"
-	"github.com/ozontech/file.d/xscram"
-	"github.com/ozontech/file.d/xtls"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/twmb/franz-go/pkg/kgo"
 	"go.uber.org/zap"
 )
 
@@ -49,13 +49,12 @@ pipelines:
 }*/
 
 type Plugin struct {
-	config        *Config
-	logger        *zap.SugaredLogger
-	session       sarama.ConsumerGroupSession
-	consumerGroup sarama.ConsumerGroup
-	cancel        context.CancelFunc
-	controller    pipeline.InputPluginController
-	idByTopic     map[string]int
+	config     *Config
+	logger     *zap.SugaredLogger
+	client     *kgo.Client
+	cancel     context.CancelFunc
+	controller pipeline.InputPluginController
+	idByTopic  map[string]int
 
 	// plugin metrics
 	commitErrorsMetric  prometheus.Counter
@@ -109,6 +108,11 @@ type Config struct {
 
 	// > @3@4@5@6
 	// >
+	// > BalancerPlan
+	BalancerPlan string `json:"balancer_plan" default:"round-robin" options:"round-robin|range|sticky|cooperative-sticky"` // *
+
+	// > @3@4@5@6
+	// >
 	// > The maximum amount of time the consumer expects a message takes to process for the user.
 	ConsumerMaxProcessingTime  cfg.Duration `json:"consumer_max_processing_time" default:"200ms" parse:"duration"` // *
 	ConsumerMaxProcessingTime_ time.Duration
@@ -127,7 +131,7 @@ type Config struct {
 	// > @3@4@5@6
 	// >
 	// > SASL mechanism to use.
-	SaslMechanism string `json:"sasl_mechanism" default:"SCRAM-SHA-512" options:"PLAIN|SCRAM-SHA-256|SCRAM-SHA-512"` // *
+	SaslMechanism string `json:"sasl_mechanism" default:"SCRAM-SHA-512" options:"PLAIN|SCRAM-SHA-256|SCRAM-SHA-512|AWS_MSK_IAM"` // *
 
 	// > @3@4@5@6
 	// >
@@ -200,7 +204,7 @@ func (p *Plugin) Start(config pipeline.AnyConfig, params *pipeline.InputPluginPa
 
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
-	p.consumerGroup = NewConsumerGroup(p.config, p.logger)
+	p.client = newClient(p.config, p.logger)
 	p.controller.UseSpread()
 	p.controller.DisableStreams()
 
@@ -215,112 +219,55 @@ func (p *Plugin) registerMetrics(ctl *metric.Ctl) {
 func (p *Plugin) consume(ctx context.Context) {
 	p.logger.Infof("kafka input reading from topics: %s", strings.Join(p.config.Topics, ","))
 	for {
-		err := p.consumerGroup.Consume(ctx, p.config.Topics, p)
-		if err != nil {
-			p.consumeErrorsMetric.Inc()
-			p.logger.Errorf("can't consume from kafka: %s", err.Error())
+		fetches := p.client.PollFetches(ctx)
+		if errs := fetches.Errors(); len(errs) > 0 {
+			for _, err := range errs {
+				p.consumeErrorsMetric.Inc()
+				p.logger.Errorf("can't consume from kafka: %s", err.Err.Error())
+			}
+			p.logger.Fatalf("unexpected unrecoverable errors encountered")
 		}
 
 		if ctx.Err() != nil {
 			return
 		}
+
+		p.ConsumeClaim(fetches)
 	}
 }
 
 func (p *Plugin) Stop() {
+	p.logger.Infof("Stopping")
+	p.client.CommitMarkedOffsets(context.Background())
+	p.client.Close()
 	p.cancel()
 }
 
 func (p *Plugin) Commit(event *pipeline.Event) {
-	session := p.session
-	if session == nil {
-		p.commitErrorsMetric.Inc()
-		p.logger.Errorf("no kafka consumer session for event commit")
-		return
+	index, partition, epoch := disassembleSourceID(event.SourceID)
+
+	offset := kgo.EpochOffset{
+		Offset: event.Offset + 1,
+		Epoch:  epoch,
 	}
-	index, partition := disassembleSourceID(event.SourceID)
-	session.MarkOffset(p.config.Topics[index], partition, event.Offset+1, "")
-}
-
-func NewConsumerGroup(c *Config, l *zap.SugaredLogger) sarama.ConsumerGroup {
-	config := sarama.NewConfig()
-	config.ClientID = c.ClientID
-
-	// kafka auth sasl
-	if c.SaslEnabled {
-		config.Net.SASL.Enable = true
-
-		config.Net.SASL.User = c.SaslUsername
-		config.Net.SASL.Password = c.SaslPassword
-
-		config.Net.SASL.Mechanism = sarama.SASLMechanism(c.SaslMechanism)
-		switch config.Net.SASL.Mechanism {
-		case sarama.SASLTypeSCRAMSHA256:
-			config.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient { return xscram.NewClient(xscram.SHA256) }
-		case sarama.SASLTypeSCRAMSHA512:
-			config.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient { return xscram.NewClient(xscram.SHA512) }
-		}
+	offsets := map[string]map[int32]kgo.EpochOffset{
+		p.config.Topics[index]: {partition: offset},
 	}
-
-	// kafka connect via SSL with PEM
-	if c.SslEnabled {
-		config.Net.TLS.Enable = true
-
-		tlsCfg := xtls.NewConfigBuilder()
-
-		if c.CACert != "" {
-			if err := tlsCfg.AppendCARoot(c.CACert); err != nil {
-				l.Fatalf("can't load ca cert: %s", err.Error())
-			}
-		}
-		tlsCfg.SetSkipVerify(c.SslSkipVerify)
-
-		if c.ClientCert != "" || c.ClientKey != "" {
-			if err := tlsCfg.AppendX509KeyPair(c.ClientCert, c.ClientKey); err != nil {
-				l.Fatalf("can't load client certificate and key: %s", err.Error())
-			}
-		}
-
-		config.Net.TLS.Config = tlsCfg.Build()
-	}
-
-	config.Consumer.Group.Rebalance.Strategy = sarama.BalanceStrategyRoundRobin
-	config.Version = sarama.V0_10_2_0
-	config.ChannelBufferSize = c.ChannelBufferSize
-	config.Consumer.MaxProcessingTime = c.ConsumerMaxProcessingTime_
-	config.Consumer.MaxWaitTime = c.ConsumerMaxWaitTime_
-
-	switch c.Offset_ {
-	case OffsetTypeOldest:
-		config.Consumer.Offsets.Initial = sarama.OffsetOldest
-	case OffsetTypeNewest:
-		config.Consumer.Offsets.Initial = sarama.OffsetNewest
-	default:
-		l.Fatalf("unexpected value of the offset field: %s", c.Offset)
-	}
-
-	consumerGroup, err := sarama.NewConsumerGroup(c.Brokers, c.ConsumerGroup, config)
-	if err != nil {
-		l.Fatalf("can't create kafka consumer: %s", err.Error())
-	}
-
-	return consumerGroup
+	p.client.MarkCommitOffsets(offsets)
 }
 
 func (p *Plugin) Setup(session sarama.ConsumerGroupSession) error {
 	p.logger.Infof("kafka consumer created with brokers %q", strings.Join(p.config.Brokers, ","))
-	p.session = session
 	return nil
 }
 
-func (p *Plugin) Cleanup(sarama.ConsumerGroupSession) error {
-	p.session = nil
-	return nil
-}
-
-func (p *Plugin) ConsumeClaim(_ sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
-	for message := range claim.Messages() {
-		sourceID := assembleSourceID(p.idByTopic[message.Topic], message.Partition)
+func (p *Plugin) ConsumeClaim(fetches kgo.Fetches) error {
+	fetches.EachRecord(func(message *kgo.Record) {
+		sourceID := assembleSourceID(
+			p.idByTopic[message.Topic],
+			message.Partition,
+			message.LeaderEpoch,
+		)
 
 		var metadataInfo metadata.MetaData
 		var err error
@@ -332,20 +279,35 @@ func (p *Plugin) ConsumeClaim(_ sarama.ConsumerGroupSession, claim sarama.Consum
 		}
 
 		_ = p.controller.In(sourceID, "kafka", message.Offset, message.Value, true, metadataInfo)
-	}
-
+	})
+	p.client.AllowRebalance()
 	return nil
 }
 
-func assembleSourceID(index int, partition int32) pipeline.SourceID {
-	return pipeline.SourceID(index<<16 + int(partition))
+func assembleSourceID(index int, partition, epoch int32) pipeline.SourceID {
+	return pipeline.SourceID(pair(pair(int32(index), partition), epoch))
 }
 
-func disassembleSourceID(sourceID pipeline.SourceID) (index int, partition int32) {
-	index = int(sourceID >> 16)
-	partition = int32(sourceID & 0xFFFF)
+func disassembleSourceID(sourceID pipeline.SourceID) (int, int32, int32) {
+	tmp, epoch := unpair(int32(sourceID))
+	index, partition := unpair(tmp)
+	return int(index), partition, epoch
+}
 
-	return
+func pair(n, m int32) int32 {
+	if n >= m {
+		return n*n + n + m
+	}
+	return m*m + n
+}
+
+func unpair(z int32) (int32, int32) {
+	q := int32(math.Floor(math.Sqrt(float64(z))))
+	l := z - q*q
+	if l < q {
+		return l, q
+	}
+	return q, l - q
 }
 
 // PassEvent decides pass or discard event.
@@ -359,7 +321,7 @@ type metaInformation struct {
 	offset    int64
 }
 
-func newMetaInformation(message *sarama.ConsumerMessage) metaInformation {
+func newMetaInformation(message *kgo.Record) metaInformation {
 	return metaInformation{
 		topic:     message.Topic,
 		partition: message.Partition,
